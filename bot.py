@@ -35,6 +35,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # optional: your own chat id fo
 
 EMAIL, MANAGER_ID = range(2)
 PRODUCT, ISSUE = range(2, 4)
+SEARCH = 4
 
 PLAN_DAYS = 30  # fixed monthly cycle - manager ID changes each renewal
 
@@ -85,8 +86,9 @@ def save_tickets(data: dict) -> None:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to Hagemaru's OTT Store!\n\n"
-        "📌 /register — track your YT plan & get expiry reminders\n"
-        "📌 /mystatus — check your plan's expiry\n"
+        "📌 /register — track a YT plan & get expiry reminders\n"
+        "📌 /mystatus — see all your registered plans\n"
+        "📌 /search <email> — look up a specific plan's Manager ID & renewal date\n"
         "📌 /support — report an issue with any product\n"
     )
 
@@ -116,7 +118,8 @@ async def get_manager_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     user_id = str(update.effective_user.id)
-    data[user_id] = {
+    data.setdefault(user_id, [])
+    data[user_id].append({
         "email": context.user_data["email"],
         "manager_id": manager_id,
         "start_date": start_date.isoformat(),
@@ -124,7 +127,7 @@ async def get_manager_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "notified_soon": False,
         "notified_expired": False,
         "username": update.effective_user.username or "",
-    }
+    })
     save_data(data)
 
     await update.message.reply_text(
@@ -132,8 +135,10 @@ async def get_manager_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📧 Email: {context.user_data['email']}\n"
         f"🆔 Manager ID: {manager_id}\n"
         f"⏳ Expires: {expiry_date.strftime('%d %b %Y')}\n\n"
-        f"I'll notify you here when it's about to expire. Use /mystatus anytime.\n"
-        f"Note: you'll get a new Manager ID each renewal — just run /register again after renewing."
+        f"I'll notify you here when it's about to expire. Use /mystatus anytime, "
+        f"or /search <email> to look up any plan you've registered.\n"
+        f"Note: you'll get a new Manager ID each renewal — just run /register again after renewing "
+        f"(you can register multiple emails, no problem)."
     )
     return ConversationHandler.END
 
@@ -240,20 +245,64 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user_id = str(update.effective_user.id)
-    record = data.get(user_id)
-    if not record:
-        await update.message.reply_text("No active plan found. Use /register to set one up.")
+    records = data.get(user_id)
+    if not records:
+        await update.message.reply_text("No active plans found. Use /register to set one up.")
         return
 
-    expiry = datetime.fromisoformat(record["expiry_date"])
-    days_left = (expiry - datetime.now()).days
-    status = f"{days_left} day(s) left" if days_left >= 0 else "EXPIRED"
+    lines = []
+    for r in records:
+        expiry = datetime.fromisoformat(r["expiry_date"])
+        days_left = (expiry - datetime.now()).days
+        status = f"{days_left} day(s) left" if days_left >= 0 else "EXPIRED"
+        lines.append(
+            f"📧 {r['email']}\n"
+            f"🆔 Manager ID: {r['manager_id']}\n"
+            f"⏳ Expiry: {expiry.strftime('%d %b %Y')} ({status})"
+        )
 
-    await update.message.reply_text(
-        f"🆔 Manager ID: {record['manager_id']}\n"
-        f"⏳ Expiry: {expiry.strftime('%d %b %Y')}\n"
-        f"📌 Status: {status}"
-    )
+    await update.message.reply_text("\n\n".join(lines))
+
+
+# ---------- search ----------
+
+async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # allow /search <term> directly, or start a conversation if no args
+    if context.args:
+        return await do_search(update, context, " ".join(context.args))
+    await update.message.reply_text("🔍 Send the email (or part of it) you want to look up.")
+    return SEARCH
+
+
+async def search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await do_search(update, context, update.message.text.strip())
+
+
+async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, term: str):
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    records = data.get(user_id, [])
+
+    term_lower = term.lower()
+    matches = [r for r in records if term_lower in r["email"].lower()]
+
+    if not matches:
+        await update.message.reply_text(f"No registered plan found matching '{term}'.")
+        return ConversationHandler.END
+
+    lines = []
+    for r in matches:
+        expiry = datetime.fromisoformat(r["expiry_date"])
+        days_left = (expiry - datetime.now()).days
+        status = f"{days_left} day(s) left" if days_left >= 0 else "EXPIRED"
+        lines.append(
+            f"📧 {r['email']}\n"
+            f"🆔 Manager ID: {r['manager_id']}\n"
+            f"⏳ Expiry: {expiry.strftime('%d %b %Y')} ({status})"
+        )
+
+    await update.message.reply_text("\n\n".join(lines))
+    return ConversationHandler.END
 
 
 # ---------- daily expiry check job ----------
@@ -263,40 +312,42 @@ async def check_expiries(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
     changed = False
 
-    for user_id, record in data.items():
-        expiry = datetime.fromisoformat(record["expiry_date"])
-        remaining = (expiry - now).days
+    for user_id, records in data.items():
+        for record in records:
+            expiry = datetime.fromisoformat(record["expiry_date"])
+            remaining = (expiry - now).days
 
-        # 1 day before expiry
-        if 0 <= remaining <= 1 and not record.get("notified_soon"):
-            try:
-                await context.bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"⏰ Heads up! Your YT plan (Manager ID: {record['manager_id']}) "
-                        f"expires on {expiry.strftime('%d %b %Y')}.\n"
-                        f"Renew soon to avoid interruption — just message us here!"
-                    ),
-                )
-                record["notified_soon"] = True
-                changed = True
-            except Exception as e:
-                logger.warning(f"Failed to notify {user_id}: {e}")
+            # 1 day before expiry
+            if 0 <= remaining <= 1 and not record.get("notified_soon"):
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"⏰ Heads up! Your YT plan ({record['email']}, Manager ID: "
+                            f"{record['manager_id']}) expires on {expiry.strftime('%d %b %Y')}.\n"
+                            f"Renew soon to avoid interruption — just message us here!"
+                        ),
+                    )
+                    record["notified_soon"] = True
+                    changed = True
+                except Exception as e:
+                    logger.warning(f"Failed to notify {user_id}: {e}")
 
-        # on/after expiry
-        if remaining < 0 and not record.get("notified_expired"):
-            try:
-                await context.bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"❌ Your YT plan (Manager ID: {record['manager_id']}) has expired.\n"
-                        f"Message us here to renew and get reconnected!"
-                    ),
-                )
-                record["notified_expired"] = True
-                changed = True
-            except Exception as e:
-                logger.warning(f"Failed to notify {user_id}: {e}")
+            # on/after expiry
+            if remaining < 0 and not record.get("notified_expired"):
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"❌ Your YT plan ({record['email']}, Manager ID: "
+                            f"{record['manager_id']}) has expired.\n"
+                            f"Message us here to renew and get reconnected!"
+                        ),
+                    )
+                    record["notified_expired"] = True
+                    changed = True
+                except Exception as e:
+                    logger.warning(f"Failed to notify {user_id}: {e}")
 
     if changed:
         save_data(data)
@@ -309,6 +360,46 @@ def main():
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("register", register_start)],
+        states={
+            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
+            MANAGER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_manager_id)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    support_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("support", support_start)],
+        states={
+            PRODUCT: [CallbackQueryHandler(support_product)],
+            ISSUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_issue)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    search_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("search", search_start)],
+        states={
+            SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(conv_handler)
+    app.add_handler(support_conv_handler)
+    app.add_handler(search_conv_handler)
+    app.add_handler(CommandHandler("mystatus", my_status))
+    app.add_handler(CommandHandler("reply", admin_reply))
+
+    # run expiry check once a day (also runs 10s after startup for a quick first pass)
+    app.job_queue.run_repeating(check_expiries, interval=timedelta(hours=24), first=10)
+
+    logger.info("Bot starting...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()ster_start)],
         states={
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
             MANAGER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_manager_id)],

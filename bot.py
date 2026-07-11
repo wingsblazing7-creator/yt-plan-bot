@@ -399,36 +399,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()ster_start)],
-        states={
-            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
-            MANAGER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_manager_id)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    support_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("support", support_start)],
-        states={
-            PRODUCT: [CallbackQueryHandler(support_product)],
-            ISSUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_issue)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(conv_handler)
-    app.add_handler(support_conv_handler)
-    app.add_handler(CommandHandler("mystatus", my_status))
-    app.add_handler(CommandHandler("reply", admin_reply))
-
-    # run expiry check once a day (also runs 10s after startup for a quick first pass)
-    app.job_queue.run_repeating(check_expiries, interval=timedelta(hours=24), first=10)
-
-    logger.info("Bot starting...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
     main()
-  
